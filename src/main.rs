@@ -1,23 +1,17 @@
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    response::IntoResponse,
+    response::{Html, IntoResponse},
     routing::get,
     Router,
 };
 use futures::{SinkExt, StreamExt};
-use serde_json::Value;
-use std::{
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-};
-use tokio::sync::broadcast;
-
-type History = Arc<Mutex<Vec<String>>>;
+use std::{net::SocketAddr, sync::Arc};
+use tokio::sync::{broadcast, Mutex};
 
 #[tokio::main]
 async fn main() {
     let (tx, _rx) = broadcast::channel::<String>(100);
-    let history: History = Arc::new(Mutex::new(Vec::new()));
+    let history = Arc::new(Mutex::new(Vec::<String>::new()));
 
     let app = Router::new()
         .route("/", get(index))
@@ -30,63 +24,134 @@ async fn main() {
             }),
         );
 
-    let port: u16 = std::env::var("PORT")
-        .unwrap_or_else(|_| "3000".into())
-        .parse()
-        .unwrap();
+    let port = std::env::var("PORT").unwrap_or("10000".into());
+    let addr = SocketAddr::from(([0, 0, 0, 0], port.parse().unwrap()));
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     println!("Listening on {}", addr);
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(
+        tokio::net::TcpListener::bind(addr).await.unwrap(),
+        app,
+    )
+    .await
+    .unwrap();
 }
 
-async fn index() -> impl IntoResponse {
-    r#"
+async fn index() -> Html<&'static str> {
+    Html(r#"
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <title>Rust GC</title>
 <style>
-body { font-family: sans-serif; background:#111; color:#eee; }
-#chat { list-style:none; padding:0; }
-li { margin:4px 0; }
-input { margin:4px 0; }
+body {
+  margin: 0;
+  font-family: Arial, sans-serif;
+  background: #2b2d31;
+  color: #dcddde;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+#chat {
+  flex: 1;
+  overflow-y: auto;
+  padding: 15px;
+}
+
+.message {
+  margin-bottom: 8px;
+}
+
+.username {
+  font-weight: bold;
+  color: #7289da;
+  margin-right: 5px;
+}
+
+#input-bar {
+  display: flex;
+  padding: 10px;
+  background: #1e1f22;
+}
+
+#name {
+  width: 120px;
+  margin-right: 8px;
+}
+
+#msg {
+  flex: 1;
+}
+
+input {
+  background: #383a40;
+  border: none;
+  color: #dcddde;
+  padding: 8px;
+  border-radius: 4px;
+}
 </style>
 </head>
 <body>
-<h2>Rust Group Chat</h2>
-<input id="name" placeholder="Username"><br>
-<input id="msg" placeholder="Message">
-<button onclick="send()">Send</button>
-<ul id="chat"></ul>
+
+<div id="chat"></div>
+
+<div id="input-bar">
+  <input id="name" placeholder="Username">
+  <input id="msg" placeholder="Message">
+</div>
 
 <script>
 let ws = new WebSocket(`wss://${location.host}/ws`);
 
+const chat = document.getElementById("chat");
+const nameInput = document.getElementById("name");
+const msgInput = document.getElementById("msg");
+
 ws.onmessage = e => {
-  const li = document.createElement("li");
-  li.textContent = e.data;
-  document.getElementById("chat").appendChild(li);
+  const div = document.createElement("div");
+  div.className = "message";
+
+  const [name, ...rest] = e.data.split(": ");
+  const msg = rest.join(": ");
+
+  div.innerHTML =
+    '<span class="username">' + name + '</span>' +
+    '<span>' + msg + '</span>';
+
+  chat.appendChild(div);
+  chat.scrollTop = chat.scrollHeight;
 };
 
 function send() {
-  const name = document.getElementById("name").value;
-  const msg = document.getElementById("msg").value;
-  ws.send(JSON.stringify({ name, msg }));
+  const name = nameInput.value.trim();
+  const msg = msgInput.value.trim();
+  if (!name || !msg) return;
+
+  ws.send(name + ": " + msg);
+  msgInput.value = "";
 }
+
+msgInput.addEventListener("keydown", e => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    send();
+  }
+});
 </script>
+
 </body>
 </html>
-"#
+"#)
 }
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
     tx: broadcast::Sender<String>,
-    history: History,
+    history: Arc<Mutex<Vec<String>>>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, tx, history))
 }
@@ -94,42 +159,28 @@ async fn ws_handler(
 async fn handle_socket(
     socket: WebSocket,
     tx: broadcast::Sender<String>,
-    history: History,
+    history: Arc<Mutex<Vec<String>>>,
 ) {
     let mut rx = tx.subscribe();
     let (mut sender, mut receiver) = socket.split();
 
-    // ✅ CLONE HISTORY BEFORE AWAIT (THIS FIXES SEND ERROR)
-    let past_messages: Vec<String> = {
-        history.lock().unwrap().clone()
-    };
-
-    for msg in past_messages {
-        let _ = sender.send(Message::Text(msg)).await;
+    // send history
+    {
+        let hist = history.lock().await;
+        for msg in hist.iter() {
+            let _ = sender.send(Message::Text(msg.clone())).await;
+        }
     }
 
-    // Task to forward broadcast messages to this client
-    let mut send_task = tokio::spawn(async move {
+    let send_task = tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
             let _ = sender.send(Message::Text(msg)).await;
         }
     });
 
-    // Receive messages from client
     while let Some(Ok(Message::Text(text))) = receiver.next().await {
-        if let Ok(value) = serde_json::from_str::<Value>(&text) {
-            if let (Some(name), Some(msg)) =
-                (value.get("name"), value.get("msg"))
-            {
-                let name = name.as_str().unwrap_or("anon");
-                let msg = msg.as_str().unwrap_or("");
-
-                let full = format!("{}: {}", name, msg);
-
-                history.lock().unwrap().push(full.clone());
-                let _ = tx.send(full);
-            }
-        }
+        history.lock().await.push(text.clone());
+        let _ = tx.send(text);
     }
 
     send_task.abort();
