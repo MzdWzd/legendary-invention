@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 
 #[tokio::main]
 async fn main() {
-    let (tx, _rx) = broadcast::channel::<String>(100);
+    let (tx, _) = broadcast::channel::<String>(100);
 
     let app = Router::new()
         .route("/", get(index))
@@ -20,13 +20,11 @@ async fn main() {
         }));
 
     let port = std::env::var("PORT")
-        .unwrap_or("3000".into())
+        .unwrap_or("10000".into())
         .parse::<u16>()
         .unwrap();
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    println!("Listening on {}", addr);
-
     axum::serve(
         tokio::net::TcpListener::bind(addr).await.unwrap(),
         app,
@@ -40,17 +38,23 @@ async fn index() -> Html<&'static str> {
 <!DOCTYPE html>
 <html>
 <head>
-<meta charset="UTF-8">
-<title>Rust GC</title>
+<meta charset="utf-8">
+<title>GC</title>
 <style>
-body {
+* { box-sizing: border-box; }
+html, body {
   margin: 0;
+  height: 100%;
   background: #1e1f22;
   color: #dcddde;
   font-family: sans-serif;
 }
+body {
+  display: flex;
+  flex-direction: column;
+}
 #chat {
-  height: 90vh;
+  flex: 1;
   overflow-y: auto;
   padding: 10px;
 }
@@ -62,14 +66,15 @@ body {
   padding: 10px;
   background: #2b2d31;
 }
-input {
+#box {
   flex: 1;
   background: #383a40;
   border: none;
   color: white;
   padding: 10px;
+  font-size: 16px;
 }
-input:focus { outline: none; }
+#box:focus { outline: none; }
 </style>
 </head>
 <body>
@@ -77,12 +82,12 @@ input:focus { outline: none; }
 <div id="chat"></div>
 
 <div id="input">
-  <input id="box" placeholder="Type message and press Enter…" />
+  <input id="box" placeholder="Type a message..." />
 </div>
 
 <script>
 let ws;
-let username = prompt("Username:");
+let username = null;
 
 function connect() {
   ws = new WebSocket(
@@ -90,28 +95,33 @@ function connect() {
     location.host + "/ws"
   );
 
-  ws.onopen = () => {
-    ws.send(username);
-  };
-
   ws.onmessage = e => {
+    const chat = document.getElementById("chat");
     const div = document.createElement("div");
     div.className = "msg";
     div.textContent = e.data;
-    document.getElementById("chat").appendChild(div);
-    document.getElementById("chat").scrollTop =
-      document.getElementById("chat").scrollHeight;
+    chat.appendChild(div);
+    chat.scrollTop = chat.scrollHeight;
   };
 }
 
 document.getElementById("box").addEventListener("keydown", e => {
-  if (e.key === "Enter" && ws.readyState === 1) {
+  if (e.key !== "Enter") return;
+  e.preventDefault();
+
+  if (!ws) connect();
+
+  if (!username) {
+    username = prompt("Username?");
+    ws.onopen = () => ws.send(username);
+    return;
+  }
+
+  if (ws.readyState === 1) {
     ws.send(e.target.value);
     e.target.value = "";
   }
 });
-
-connect();
 </script>
 
 </body>
@@ -136,7 +146,16 @@ async fn handle_socket(mut socket: WebSocket, tx: broadcast::Sender<String>) {
         }
     });
 
+    let username = match receiver.next().await {
+        Some(Ok(Message::Text(name))) => name,
+        _ => return,
+    };
+
+    let _ = tx.send(format!("🔵 {} joined", username));
+
     while let Some(Ok(Message::Text(text))) = receiver.next().await {
-        let _ = tx.send(text);
+        let _ = tx.send(format!("{}: {}", username, text));
     }
+
+    let _ = tx.send(format!("🔴 {} left", username));
 }
