@@ -55,27 +55,25 @@ async fn index() -> impl IntoResponse {
 <ul id="chat"></ul>
 
 <script>
-let ws;
+const ws = new WebSocket(
+  (location.protocol === "https:" ? "wss://" : "ws://") +
+  location.host +
+  "/ws"
+);
+
+ws.onmessage = e => {
+  const li = document.createElement("li");
+  li.textContent = e.data;
+  document.getElementById("chat").appendChild(li);
+};
 
 function send() {
-  if (!ws) {
-    ws = new WebSocket(`wss://${location.host}/ws`);
-    ws.onmessage = e => {
-      const li = document.createElement("li");
-      li.textContent = e.data;
-      document.getElementById("chat").appendChild(li);
-    };
-  }
-
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(
-      document.getElementById("name").value +
-      ": " +
-      document.getElementById("msg").value
-    );
-  }
+  const name = document.getElementById("name").value || "anon";
+  const msg = document.getElementById("msg").value;
+  ws.send(name + ": " + msg);
 }
 </script>
+
 
 </body>
 </html>
