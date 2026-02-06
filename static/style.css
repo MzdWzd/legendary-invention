@@ -1,0 +1,24 @@
+body {
+  margin: 0;
+  font-family: Arial;
+  background: #2b2d31;
+  color: white;
+}
+
+#chat {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+#messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px;
+}
+
+input {
+  padding: 10px;
+  border: none;
+  outline: none;
+}
