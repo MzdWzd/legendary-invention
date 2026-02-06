@@ -1,161 +1,51 @@
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    response::{Html, IntoResponse},
+    response::IntoResponse,
     routing::get,
     Router,
 };
 use futures::{SinkExt, StreamExt};
-use std::net::SocketAddr;
-use tokio::sync::broadcast;
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
+use tower_http::services::ServeDir;
+
+type History = Arc<Mutex<Vec<String>>>;
 
 #[tokio::main]
 async fn main() {
-    let (tx, _) = broadcast::channel::<String>(100);
+    let history: History = Arc::new(Mutex::new(Vec::new()));
 
     let app = Router::new()
-        .route("/", get(index))
         .route("/ws", get({
-            let tx = tx.clone();
-            move |ws| ws_handler(ws, tx.clone())
-        }));
+            let history = history.clone();
+            move |ws: WebSocketUpgrade| handle_ws(ws, history.clone())
+        }))
+        .nest_service("/", ServeDir::new("static"));
 
-    let port = std::env::var("PORT")
-        .unwrap_or("10000".into())
-        .parse::<u16>()
+    let addr = SocketAddr::from(([0, 0, 0, 0], 10000));
+    println!("Listening on {}", addr);
+
+    axum::Server::bind(&addr)
+        .serve(app.into_make_service())
+        .await
         .unwrap();
-
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    axum::serve(
-        tokio::net::TcpListener::bind(addr).await.unwrap(),
-        app,
-    )
-    .await
-    .unwrap();
 }
 
-async fn index() -> Html<&'static str> {
-    Html(r#"
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>GC</title>
-<style>
-* { box-sizing: border-box; }
-html, body {
-  margin: 0;
-  height: 100%;
-  background: #1e1f22;
-  color: #dcddde;
-  font-family: sans-serif;
-}
-body {
-  display: flex;
-  flex-direction: column;
-}
-#chat {
-  flex: 1;
-  overflow-y: auto;
-  padding: 10px;
-}
-.msg {
-  margin-bottom: 6px;
-}
-#input {
-  display: flex;
-  padding: 10px;
-  background: #2b2d31;
-}
-#box {
-  flex: 1;
-  background: #383a40;
-  border: none;
-  color: white;
-  padding: 10px;
-  font-size: 16px;
-}
-#box:focus { outline: none; }
-</style>
-</head>
-<body>
-
-<div id="chat"></div>
-
-<div id="input">
-  <input id="box" placeholder="Type a message..." />
-</div>
-
-<script>
-let ws;
-let username = null;
-
-function connect() {
-  ws = new WebSocket(
-    (location.protocol === "https:" ? "wss://" : "ws://") +
-    location.host + "/ws"
-  );
-
-  ws.onmessage = e => {
-    const chat = document.getElementById("chat");
-    const div = document.createElement("div");
-    div.className = "msg";
-    div.textContent = e.data;
-    chat.appendChild(div);
-    chat.scrollTop = chat.scrollHeight;
-  };
+fn handle_ws(ws: WebSocketUpgrade, history: History) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| socket_handler(socket, history))
 }
 
-document.getElementById("box").addEventListener("keydown", e => {
-  if (e.key !== "Enter") return;
-  e.preventDefault();
-
-  if (!ws) connect();
-
-  if (!username) {
-    username = prompt("Username?");
-    ws.onopen = () => ws.send(username);
-    return;
-  }
-
-  if (ws.readyState === 1) {
-    ws.send(e.target.value);
-    e.target.value = "";
-  }
-});
-</script>
-
-</body>
-</html>
-"#)
-}
-
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    tx: broadcast::Sender<String>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, tx))
-}
-
-async fn handle_socket(mut socket: WebSocket, tx: broadcast::Sender<String>) {
-    let mut rx = tx.subscribe();
-    let (mut sender, mut receiver) = socket.split();
-
-    tokio::spawn(async move {
-        while let Ok(msg) = rx.recv().await {
-            let _ = sender.send(Message::Text(msg)).await;
-        }
-    });
-
-    let username = match receiver.next().await {
-        Some(Ok(Message::Text(name))) => name,
-        _ => return,
-    };
-
-    let _ = tx.send(format!("🔵 {} joined", username));
-
-    while let Some(Ok(Message::Text(text))) = receiver.next().await {
-        let _ = tx.send(format!("{}: {}", username, text));
+async fn socket_handler(mut socket: WebSocket, history: History) {
+    // send history
+    let past = history.lock().unwrap().clone();
+    for msg in past {
+        let _ = socket.send(Message::Text(msg)).await;
     }
 
-    let _ = tx.send(format!("🔴 {} left", username));
+    while let Some(Ok(Message::Text(text))) = socket.recv().await {
+        history.lock().unwrap().push(text.clone());
+        let _ = socket.send(Message::Text(text)).await;
+    }
 }
