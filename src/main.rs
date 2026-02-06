@@ -1,91 +1,42 @@
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    response::IntoResponse,
+    response::{Html, IntoResponse},
     routing::get,
     Router,
 };
 use futures::{SinkExt, StreamExt};
-use once_cell::sync::Lazy;
-use std::{
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-};
+use std::net::SocketAddr;
 use tokio::sync::broadcast;
-
-static HISTORY: Lazy<Arc<Mutex<Vec<String>>>> =
-    Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
 
 #[tokio::main]
 async fn main() {
-    let (tx, _) = broadcast::channel::<String>(100);
+    let (tx, _rx) = broadcast::channel::<String>(100);
 
     let app = Router::new()
         .route("/", get(index))
-        .route(
-            "/ws",
-            get(move |ws: WebSocketUpgrade| {
-                let tx = tx.clone();
-                let history = HISTORY.clone();
-                async move { ws.on_upgrade(move |socket| handle_socket(socket, tx, history)) }
-            }),
-        );
+        .route("/ws", get({
+            let tx = tx.clone();
+            move |ws| ws_handler(ws, tx.clone())
+        }));
 
-    let port: u16 = std::env::var("PORT")
-        .unwrap_or_else(|_| "3000".into())
-        .parse()
+    let port = std::env::var("PORT")
+        .unwrap_or("3000".into())
+        .parse::<u16>()
         .unwrap();
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    axum::serve(tokio::net::TcpListener::bind(addr).await.unwrap(), app).await.unwrap();
+    println!("Listening on {}", addr);
+
+    axum::serve(
+        tokio::net::TcpListener::bind(addr).await.unwrap(),
+        app,
+    )
+    .await
+    .unwrap();
 }
 
-async fn handle_socket(
-    socket: WebSocket,
-    tx: broadcast::Sender<String>,
-    history: Arc<Mutex<Vec<String>>>,
-) {
-    let mut rx = tx.subscribe();
-    let (mut sender, mut receiver) = socket.split();
-
-    // Send history first
-    {
-        let hist = history.lock().unwrap().clone();
-        for msg in hist {
-            let _ = sender.send(Message::Text(msg)).await;
-        }
-    }
-
-    let send_task = tokio::spawn(async move {
-        while let Ok(msg) = rx.recv().await {
-            let _ = sender.send(Message::Text(msg)).await;
-        }
-    });
-
-    let recv_task = tokio::spawn(async move {
-        let mut username: Option<String> = None;
-
-        while let Some(Ok(Message::Text(text))) = receiver.next().await {
-            if username.is_none() {
-                username = Some(text.clone());
-                continue;
-            }
-
-            let msg = format!("{}: {}", username.clone().unwrap(), text);
-            let _ = tx.send(msg.clone());
-
-            let mut hist = HISTORY.lock().unwrap();
-            hist.push(msg);
-            if hist.len() > 200 {
-                hist.remove(0);
-            }
-        }
-    });
-
-    let _ = tokio::join!(send_task, recv_task);
-}
-
-async fn index() -> impl IntoResponse {
-    r#"
+async fn index() -> Html<&'static str> {
+    Html(r#"
 <!DOCTYPE html>
 <html>
 <head>
@@ -165,5 +116,27 @@ connect();
 
 </body>
 </html>
-"#
+"#)
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    tx: broadcast::Sender<String>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, tx))
+}
+
+async fn handle_socket(mut socket: WebSocket, tx: broadcast::Sender<String>) {
+    let mut rx = tx.subscribe();
+    let (mut sender, mut receiver) = socket.split();
+
+    tokio::spawn(async move {
+        while let Ok(msg) = rx.recv().await {
+            let _ = sender.send(Message::Text(msg)).await;
+        }
+    });
+
+    while let Some(Ok(Message::Text(text))) = receiver.next().await {
+        let _ = tx.send(text);
+    }
 }
