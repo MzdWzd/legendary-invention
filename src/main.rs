@@ -32,16 +32,19 @@ async fn main() {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     println!("Listening on {}", addr);
 
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
+    // Axum 0.7 server startup (REQUIRED)
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
 
 async fn index() -> impl IntoResponse {
     r#"
 <!DOCTYPE html>
 <html>
+<head>
+<meta charset="utf-8">
+<title>Rust Chat</title>
+</head>
 <body>
 <h2>Rust Chat</h2>
 
@@ -88,18 +91,18 @@ async fn ws_handler(
     })
 }
 
-async fn handle_socket(mut socket: WebSocket, tx: broadcast::Sender<String>) {
+async fn handle_socket(socket: WebSocket, tx: broadcast::Sender<String>) {
     let mut rx = tx.subscribe();
     let (mut sender, mut receiver) = socket.split();
 
-    // Send broadcast messages to client
+    // Broadcast → client
     tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
             let _ = sender.send(Message::Text(msg)).await;
         }
     });
 
-    // Receive client messages
+    // Client → broadcast
     while let Some(Ok(Message::Text(text))) = receiver.next().await {
         let _ = tx.send(text);
     }
