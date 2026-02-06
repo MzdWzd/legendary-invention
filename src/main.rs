@@ -5,18 +5,23 @@ use axum::{
     Router,
 };
 use futures::{SinkExt, StreamExt};
-use std::net::SocketAddr;
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 use tokio::sync::broadcast;
 
 #[tokio::main]
 async fn main() {
     let (tx, _rx) = broadcast::channel::<String>(100);
+    let history = Arc::new(Mutex::new(Vec::<String>::new()));
 
     let app = Router::new()
         .route("/", get(index))
         .route("/ws", get({
             let tx = tx.clone();
-            move |ws| ws_handler(ws, tx)
+            let history = history.clone();
+            move |ws| ws_handler(ws, tx, history)
         }));
 
     let port: u16 = std::env::var("PORT")
@@ -54,8 +59,8 @@ async fn index() -> Html<&'static str> {
       height: 300px;
       overflow-y: auto;
       padding: 8px;
-      margin-bottom: 8px;
       background: #1e1e1e;
+      margin-bottom: 8px;
     }
     input, button {
       width: 100%;
@@ -86,12 +91,14 @@ async fn index() -> Html<&'static str> {
       const div = document.createElement("div");
       div.textContent = e.data;
       document.getElementById("chat").appendChild(div);
+      document.getElementById("chat").scrollTop =
+        document.getElementById("chat").scrollHeight;
     };
 
     function send() {
       const name = document.getElementById("name").value || "anon";
       const msg = document.getElementById("msg").value;
-      ws.send(name + ": " + msg);
+      ws.send(JSON.stringify({ name, msg }));
       document.getElementById("msg").value = "";
     }
   </script>
@@ -103,21 +110,55 @@ async fn index() -> Html<&'static str> {
 async fn ws_handler(
     ws: WebSocketUpgrade,
     tx: broadcast::Sender<String>,
+    history: Arc<Mutex<Vec<String>>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, tx))
+    ws.on_upgrade(move |socket| handle_socket(socket, tx, history))
 }
 
-async fn handle_socket(socket: WebSocket, tx: broadcast::Sender<String>) {
+async fn handle_socket(
+    socket: WebSocket,
+    tx: broadcast::Sender<String>,
+    history: Arc<Mutex<Vec<String>>>,
+) {
     let mut rx = tx.subscribe();
     let (mut sender, mut receiver) = socket.split();
 
+    // 🔹 Send chat history to new user
+    {
+        let history = history.lock().unwrap();
+        for msg in history.iter() {
+            let _ = sender.send(Message::Text(msg.clone())).await;
+        }
+    }
+
+    // 🔹 Save username per socket
+    let mut username = String::from("anon");
+
+    // 🔹 Forward broadcast messages to this socket
     tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
             let _ = sender.send(Message::Text(msg)).await;
         }
     });
 
+    // 🔹 Handle incoming messages
     while let Some(Ok(Message::Text(text))) = receiver.next().await {
-        let _ = tx.send(text);
+        // Expect JSON: { name, msg }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let (Some(name), Some(msg)) = (value["name"].as_str(), value["msg"].as_str()) {
+                username = name.to_string();
+                let formatted = format!("{}: {}", username, msg);
+
+                {
+                    let mut history = history.lock().unwrap();
+                    history.push(formatted.clone());
+                    if history.len() > 100 {
+                        history.remove(0);
+                    }
+                }
+
+                let _ = tx.send(formatted);
+            }
+        }
     }
 }
