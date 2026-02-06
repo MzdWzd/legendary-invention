@@ -1,5 +1,5 @@
 use axum::{
-    extract::ws::{WebSocket, WebSocketUpgrade, Message},
+    extract::ws::{Message, WebSocket, WebSocketUpgrade},
     response::IntoResponse,
     routing::get,
     Router,
@@ -14,10 +14,23 @@ async fn main() {
 
     let app = Router::new()
         .route("/", get(index))
-        .route("/ws", get(move |ws| ws_handler(ws, tx.clone())));
+        .route(
+            "/ws",
+            get(move |ws: WebSocketUpgrade| {
+                let tx = tx.clone();
+                async move {
+                    ws_handler(ws, tx).await
+                }
+            }),
+        );
 
-    let port = std::env::var("PORT").unwrap_or("3000".into());
-    let addr = SocketAddr::from(([0, 0, 0, 0], port.parse().unwrap()));
+    let port: u16 = std::env::var("PORT")
+        .unwrap_or_else(|_| "3000".to_string())
+        .parse()
+        .unwrap();
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    println!("Listening on {}", addr);
 
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
@@ -31,13 +44,16 @@ async fn index() -> impl IntoResponse {
 <html>
 <body>
 <h2>Rust Chat</h2>
+
 <input id="name" placeholder="Username"><br>
 <input id="msg" placeholder="Message">
 <button onclick="send()">Send</button>
+
 <ul id="chat"></ul>
 
 <script>
 let ws;
+
 function send() {
   if (!ws) {
     ws = new WebSocket(`wss://${location.host}/ws`);
@@ -47,12 +63,8 @@ function send() {
       document.getElementById("chat").appendChild(li);
     };
   }
-  ws.onopen = () => {
-    const name = document.getElementById("name").value;
-    const msg = document.getElementById("msg").value;
-    ws.send(name + ": " + msg);
-  };
-  if (ws.readyState === 1) {
+
+  if (ws.readyState === WebSocket.OPEN) {
     ws.send(
       document.getElementById("name").value +
       ": " +
@@ -61,6 +73,7 @@ function send() {
   }
 }
 </script>
+
 </body>
 </html>
 "#
@@ -70,20 +83,23 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     tx: broadcast::Sender<String>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, tx))
+    ws.on_upgrade(move |socket| async move {
+        handle_socket(socket, tx).await
+    })
 }
 
 async fn handle_socket(mut socket: WebSocket, tx: broadcast::Sender<String>) {
     let mut rx = tx.subscribe();
-
     let (mut sender, mut receiver) = socket.split();
 
+    // Send broadcast messages to client
     tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
             let _ = sender.send(Message::Text(msg)).await;
         }
     });
 
+    // Receive client messages
     while let Some(Ok(Message::Text(text))) = receiver.next().await {
         let _ = tx.send(text);
     }
