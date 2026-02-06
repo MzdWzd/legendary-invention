@@ -1,6 +1,6 @@
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    response::IntoResponse,
+    response::{Html, IntoResponse},
     routing::get,
     Router,
 };
@@ -14,50 +14,67 @@ async fn main() {
 
     let app = Router::new()
         .route("/", get(index))
-        .route(
-            "/ws",
-            get(move |ws: WebSocketUpgrade| {
-                let tx = tx.clone();
-                async move {
-                    ws_handler(ws, tx).await
-                }
-            }),
-        );
+        .route("/ws", get({
+            let tx = tx.clone();
+            move |ws| ws_handler(ws, tx)
+        }));
 
     let port: u16 = std::env::var("PORT")
-        .unwrap_or_else(|_| "3000".to_string())
+        .unwrap_or_else(|_| "3000".into())
         .parse()
         .unwrap();
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     println!("Listening on {}", addr);
 
-    // Axum 0.7 server startup (REQUIRED)
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(
+        tokio::net::TcpListener::bind(addr).await.unwrap(),
+        app,
+    )
+    .await
+    .unwrap();
 }
 
-async fn index() -> impl IntoResponse {
-    r#"
+async fn index() -> Html<&'static str> {
+    Html(r#"
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Rust GC</title>
+  <title>Rust Group Chat</title>
   <style>
-    body { font-family: sans-serif; max-width: 600px; margin: auto; }
-    #chat { border: 1px solid #ccc; height: 300px; overflow-y: auto; padding: 5px; }
-    input { width: 100%; margin: 4px 0; }
-    button { width: 100%; }
+    body {
+      font-family: sans-serif;
+      max-width: 600px;
+      margin: auto;
+      background: #111;
+      color: #eee;
+    }
+    #chat {
+      border: 1px solid #444;
+      height: 300px;
+      overflow-y: auto;
+      padding: 8px;
+      margin-bottom: 8px;
+      background: #1e1e1e;
+    }
+    input, button {
+      width: 100%;
+      margin: 4px 0;
+      padding: 6px;
+      background: #222;
+      color: #eee;
+      border: 1px solid #444;
+    }
   </style>
 </head>
 <body>
   <h2>Group Chat</h2>
 
-  <input id="name" placeholder="Username">
-  <input id="msg" placeholder="Type a message">
-  <button onclick="send()">Send</button>
+  <div id="chat"></div>
 
-  <ul id="chat"></ul>
+  <input id="name" placeholder="Username">
+  <input id="msg" placeholder="Message">
+  <button onclick="send()">Send</button>
 
   <script>
     const ws = new WebSocket(
@@ -66,47 +83,40 @@ async fn index() -> impl IntoResponse {
     );
 
     ws.onmessage = e => {
-      const li = document.createElement("li");
-      li.textContent = e.data;
-      document.getElementById("chat").appendChild(li);
+      const div = document.createElement("div");
+      div.textContent = e.data;
+      document.getElementById("chat").appendChild(div);
     };
 
     function send() {
-      ws.send(
-        document.getElementById("name").value +
-        ": " +
-        document.getElementById("msg").value
-      );
+      const name = document.getElementById("name").value || "anon";
+      const msg = document.getElementById("msg").value;
+      ws.send(name + ": " + msg);
       document.getElementById("msg").value = "";
     }
   </script>
 </body>
 </html>
-
-"#
+"#)
 }
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
     tx: broadcast::Sender<String>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| async move {
-        handle_socket(socket, tx).await
-    })
+    ws.on_upgrade(move |socket| handle_socket(socket, tx))
 }
 
 async fn handle_socket(socket: WebSocket, tx: broadcast::Sender<String>) {
     let mut rx = tx.subscribe();
     let (mut sender, mut receiver) = socket.split();
 
-    // Broadcast → client
     tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
             let _ = sender.send(Message::Text(msg)).await;
         }
     });
 
-    // Client → broadcast
     while let Some(Ok(Message::Text(text))) = receiver.next().await {
         let _ = tx.send(text);
     }
