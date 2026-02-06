@@ -99,24 +99,23 @@ async fn handle_socket(
     let mut rx = tx.subscribe();
     let (mut sender, mut receiver) = socket.split();
 
-    // Send chat history to new client
-    {
-        let hist = history.lock().unwrap();
-        for msg in hist.iter() {
-            let _ = sender.send(Message::Text(msg.clone())).await;
-        }
+    // ✅ CLONE HISTORY BEFORE AWAIT (THIS FIXES SEND ERROR)
+    let past_messages: Vec<String> = {
+        history.lock().unwrap().clone()
+    };
+
+    for msg in past_messages {
+        let _ = sender.send(Message::Text(msg)).await;
     }
 
-    let mut username: Option<String> = None;
-
-    // Task: broadcast messages to this socket
+    // Task to forward broadcast messages to this client
     let mut send_task = tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
             let _ = sender.send(Message::Text(msg)).await;
         }
     });
 
-    // Receive messages from this socket
+    // Receive messages from client
     while let Some(Ok(Message::Text(text))) = receiver.next().await {
         if let Ok(value) = serde_json::from_str::<Value>(&text) {
             if let (Some(name), Some(msg)) =
@@ -125,7 +124,6 @@ async fn handle_socket(
                 let name = name.as_str().unwrap_or("anon");
                 let msg = msg.as_str().unwrap_or("");
 
-                username = Some(name.to_string());
                 let full = format!("{}: {}", name, msg);
 
                 history.lock().unwrap().push(full.clone());
