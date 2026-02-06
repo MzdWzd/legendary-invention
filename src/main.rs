@@ -42,41 +42,47 @@ async fn index() -> impl IntoResponse {
 <!DOCTYPE html>
 <html>
 <head>
-<meta charset="utf-8">
-<title>Rust Chat</title>
+  <title>Rust GC</title>
+  <style>
+    body { font-family: sans-serif; max-width: 600px; margin: auto; }
+    #chat { border: 1px solid #ccc; height: 300px; overflow-y: auto; padding: 5px; }
+    input { width: 100%; margin: 4px 0; }
+    button { width: 100%; }
+  </style>
 </head>
 <body>
-<h2>Rust Chat</h2>
+  <h2>Group Chat</h2>
 
-<input id="name" placeholder="Username"><br>
-<input id="msg" placeholder="Message">
-<button onclick="send()">Send</button>
+  <input id="name" placeholder="Username">
+  <input id="msg" placeholder="Type a message">
+  <button onclick="send()">Send</button>
 
-<ul id="chat"></ul>
+  <ul id="chat"></ul>
 
-<script>
-const ws = new WebSocket(
-  (location.protocol === "https:" ? "wss://" : "ws://") +
-  location.host +
-  "/ws"
-);
+  <script>
+    const ws = new WebSocket(
+      (location.protocol === "https:" ? "wss://" : "ws://") +
+      location.host + "/ws"
+    );
 
-ws.onmessage = e => {
-  const li = document.createElement("li");
-  li.textContent = e.data;
-  document.getElementById("chat").appendChild(li);
-};
+    ws.onmessage = e => {
+      const li = document.createElement("li");
+      li.textContent = e.data;
+      document.getElementById("chat").appendChild(li);
+    };
 
-function send() {
-  const name = document.getElementById("name").value || "anon";
-  const msg = document.getElementById("msg").value;
-  ws.send(name + ": " + msg);
-}
-</script>
-
-
+    function send() {
+      ws.send(
+        document.getElementById("name").value +
+        ": " +
+        document.getElementById("msg").value
+      );
+      document.getElementById("msg").value = "";
+    }
+  </script>
 </body>
 </html>
+
 "#
 }
 
