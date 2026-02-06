@@ -1,28 +1,34 @@
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    response::{Html, IntoResponse},
+    response::IntoResponse,
     routing::get,
     Router,
 };
 use futures::{SinkExt, StreamExt};
+use serde_json::Value;
 use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
 use tokio::sync::broadcast;
 
+type History = Arc<Mutex<Vec<String>>>;
+
 #[tokio::main]
 async fn main() {
     let (tx, _rx) = broadcast::channel::<String>(100);
-    let history = Arc::new(Mutex::new(Vec::<String>::new()));
+    let history: History = Arc::new(Mutex::new(Vec::new()));
 
     let app = Router::new()
         .route("/", get(index))
-        .route("/ws", get({
-            let tx = tx.clone();
-            let history = history.clone();
-            move |ws| ws_handler(ws, tx, history)
-        }));
+        .route(
+            "/ws",
+            get({
+                let tx = tx.clone();
+                let history = history.clone();
+                move |ws| ws_handler(ws, tx.clone(), history.clone())
+            }),
+        );
 
     let port: u16 = std::env::var("PORT")
         .unwrap_or_else(|_| "3000".into())
@@ -32,85 +38,55 @@ async fn main() {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     println!("Listening on {}", addr);
 
-    axum::serve(
-        tokio::net::TcpListener::bind(addr).await.unwrap(),
-        app,
-    )
-    .await
-    .unwrap();
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
 
-async fn index() -> Html<&'static str> {
-    Html(r#"
+async fn index() -> impl IntoResponse {
+    r#"
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Rust Group Chat</title>
-  <style>
-    body {
-      font-family: sans-serif;
-      max-width: 600px;
-      margin: auto;
-      background: #111;
-      color: #eee;
-    }
-    #chat {
-      border: 1px solid #444;
-      height: 300px;
-      overflow-y: auto;
-      padding: 8px;
-      background: #1e1e1e;
-      margin-bottom: 8px;
-    }
-    input, button {
-      width: 100%;
-      margin: 4px 0;
-      padding: 6px;
-      background: #222;
-      color: #eee;
-      border: 1px solid #444;
-    }
-  </style>
+<meta charset="utf-8">
+<title>Rust GC</title>
+<style>
+body { font-family: sans-serif; background:#111; color:#eee; }
+#chat { list-style:none; padding:0; }
+li { margin:4px 0; }
+input { margin:4px 0; }
+</style>
 </head>
 <body>
-  <h2>Group Chat</h2>
+<h2>Rust Group Chat</h2>
+<input id="name" placeholder="Username"><br>
+<input id="msg" placeholder="Message">
+<button onclick="send()">Send</button>
+<ul id="chat"></ul>
 
-  <div id="chat"></div>
+<script>
+let ws = new WebSocket(`wss://${location.host}/ws`);
 
-  <input id="name" placeholder="Username">
-  <input id="msg" placeholder="Message">
-  <button onclick="send()">Send</button>
+ws.onmessage = e => {
+  const li = document.createElement("li");
+  li.textContent = e.data;
+  document.getElementById("chat").appendChild(li);
+};
 
-  <script>
-    const ws = new WebSocket(
-      (location.protocol === "https:" ? "wss://" : "ws://") +
-      location.host + "/ws"
-    );
-
-    ws.onmessage = e => {
-      const div = document.createElement("div");
-      div.textContent = e.data;
-      document.getElementById("chat").appendChild(div);
-      document.getElementById("chat").scrollTop =
-        document.getElementById("chat").scrollHeight;
-    };
-
-    function send() {
-      const name = document.getElementById("name").value || "anon";
-      const msg = document.getElementById("msg").value;
-      ws.send(JSON.stringify({ name, msg }));
-      document.getElementById("msg").value = "";
-    }
-  </script>
+function send() {
+  const name = document.getElementById("name").value;
+  const msg = document.getElementById("msg").value;
+  ws.send(JSON.stringify({ name, msg }));
+}
+</script>
 </body>
 </html>
-"#)
+"#
 }
 
 async fn ws_handler(
     ws: WebSocketUpgrade,
     tx: broadcast::Sender<String>,
-    history: Arc<Mutex<Vec<String>>>,
+    history: History,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, tx, history))
 }
@@ -118,47 +94,45 @@ async fn ws_handler(
 async fn handle_socket(
     socket: WebSocket,
     tx: broadcast::Sender<String>,
-    history: Arc<Mutex<Vec<String>>>,
+    history: History,
 ) {
     let mut rx = tx.subscribe();
     let (mut sender, mut receiver) = socket.split();
 
-    // 🔹 Send chat history to new user
+    // Send chat history to new client
     {
-        let history = history.lock().unwrap();
-        for msg in history.iter() {
+        let hist = history.lock().unwrap();
+        for msg in hist.iter() {
             let _ = sender.send(Message::Text(msg.clone())).await;
         }
     }
 
-    // 🔹 Save username per socket
-    let mut username = String::from("anon");
+    let mut username: Option<String> = None;
 
-    // 🔹 Forward broadcast messages to this socket
-    tokio::spawn(async move {
+    // Task: broadcast messages to this socket
+    let mut send_task = tokio::spawn(async move {
         while let Ok(msg) = rx.recv().await {
             let _ = sender.send(Message::Text(msg)).await;
         }
     });
 
-    // 🔹 Handle incoming messages
+    // Receive messages from this socket
     while let Some(Ok(Message::Text(text))) = receiver.next().await {
-        // Expect JSON: { name, msg }
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-            if let (Some(name), Some(msg)) = (value["name"].as_str(), value["msg"].as_str()) {
-                username = name.to_string();
-                let formatted = format!("{}: {}", username, msg);
+        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+            if let (Some(name), Some(msg)) =
+                (value.get("name"), value.get("msg"))
+            {
+                let name = name.as_str().unwrap_or("anon");
+                let msg = msg.as_str().unwrap_or("");
 
-                {
-                    let mut history = history.lock().unwrap();
-                    history.push(formatted.clone());
-                    if history.len() > 100 {
-                        history.remove(0);
-                    }
-                }
+                username = Some(name.to_string());
+                let full = format!("{}: {}", name, msg);
 
-                let _ = tx.send(formatted);
+                history.lock().unwrap().push(full.clone());
+                let _ = tx.send(full);
             }
         }
     }
+
+    send_task.abort();
 }
