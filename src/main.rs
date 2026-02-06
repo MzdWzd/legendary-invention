@@ -1,159 +1,42 @@
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    response::{Html, IntoResponse},
+    response::IntoResponse,
     routing::get,
     Router,
 };
 use futures::{SinkExt, StreamExt};
-use std::{net::SocketAddr, sync::Arc};
-use tokio::sync::{broadcast, Mutex};
+use once_cell::sync::Lazy;
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
+use tokio::sync::broadcast;
+
+static HISTORY: Lazy<Arc<Mutex<Vec<String>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
 
 #[tokio::main]
 async fn main() {
-    let (tx, _rx) = broadcast::channel::<String>(100);
-    let history = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (tx, _) = broadcast::channel::<String>(100);
 
     let app = Router::new()
         .route("/", get(index))
         .route(
             "/ws",
-            get({
+            get(move |ws: WebSocketUpgrade| {
                 let tx = tx.clone();
-                let history = history.clone();
-                move |ws| ws_handler(ws, tx.clone(), history.clone())
+                let history = HISTORY.clone();
+                async move { ws.on_upgrade(move |socket| handle_socket(socket, tx, history)) }
             }),
         );
 
-    let port = std::env::var("PORT").unwrap_or("10000".into());
-    let addr = SocketAddr::from(([0, 0, 0, 0], port.parse().unwrap()));
+    let port: u16 = std::env::var("PORT")
+        .unwrap_or_else(|_| "3000".into())
+        .parse()
+        .unwrap();
 
-    println!("Listening on {}", addr);
-
-    axum::serve(
-        tokio::net::TcpListener::bind(addr).await.unwrap(),
-        app,
-    )
-    .await
-    .unwrap();
-}
-
-async fn index() -> Html<&'static str> {
-    Html(r#"
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Rust GC</title>
-<style>
-body {
-  margin: 0;
-  font-family: Arial, sans-serif;
-  background: #2b2d31;
-  color: #dcddde;
-  display: flex;
-  flex-direction: column;
-  height: 100vh;
-}
-
-#chat {
-  flex: 1;
-  overflow-y: auto;
-  padding: 15px;
-}
-
-.message {
-  margin-bottom: 8px;
-}
-
-.username {
-  font-weight: bold;
-  color: #7289da;
-  margin-right: 5px;
-}
-
-#input-bar {
-  display: flex;
-  padding: 10px;
-  background: #1e1f22;
-}
-
-#name {
-  width: 120px;
-  margin-right: 8px;
-}
-
-#msg {
-  flex: 1;
-}
-
-input {
-  background: #383a40;
-  border: none;
-  color: #dcddde;
-  padding: 8px;
-  border-radius: 4px;
-}
-</style>
-</head>
-<body>
-
-<div id="chat"></div>
-
-<div id="input-bar">
-  <input id="name" placeholder="Username">
-  <input id="msg" placeholder="Message">
-</div>
-
-<script>
-let ws = new WebSocket(`wss://${location.host}/ws`);
-
-const chat = document.getElementById("chat");
-const nameInput = document.getElementById("name");
-const msgInput = document.getElementById("msg");
-
-ws.onmessage = e => {
-  const div = document.createElement("div");
-  div.className = "message";
-
-  const [name, ...rest] = e.data.split(": ");
-  const msg = rest.join(": ");
-
-  div.innerHTML =
-    '<span class="username">' + name + '</span>' +
-    '<span>' + msg + '</span>';
-
-  chat.appendChild(div);
-  chat.scrollTop = chat.scrollHeight;
-};
-
-function send() {
-  const name = nameInput.value.trim();
-  const msg = msgInput.value.trim();
-  if (!name || !msg) return;
-
-  ws.send(name + ": " + msg);
-  msgInput.value = "";
-}
-
-msgInput.addEventListener("keydown", e => {
-  if (e.key === "Enter") {
-    e.preventDefault();
-    send();
-  }
-});
-</script>
-
-</body>
-</html>
-"#)
-}
-
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    tx: broadcast::Sender<String>,
-    history: Arc<Mutex<Vec<String>>>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, tx, history))
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    axum::serve(tokio::net::TcpListener::bind(addr).await.unwrap(), app).await.unwrap();
 }
 
 async fn handle_socket(
@@ -164,11 +47,11 @@ async fn handle_socket(
     let mut rx = tx.subscribe();
     let (mut sender, mut receiver) = socket.split();
 
-    // send history
+    // Send history first
     {
-        let hist = history.lock().await;
-        for msg in hist.iter() {
-            let _ = sender.send(Message::Text(msg.clone())).await;
+        let hist = history.lock().unwrap().clone();
+        for msg in hist {
+            let _ = sender.send(Message::Text(msg)).await;
         }
     }
 
@@ -178,10 +61,109 @@ async fn handle_socket(
         }
     });
 
-    while let Some(Ok(Message::Text(text))) = receiver.next().await {
-        history.lock().await.push(text.clone());
-        let _ = tx.send(text);
-    }
+    let recv_task = tokio::spawn(async move {
+        let mut username: Option<String> = None;
 
-    send_task.abort();
+        while let Some(Ok(Message::Text(text))) = receiver.next().await {
+            if username.is_none() {
+                username = Some(text.clone());
+                continue;
+            }
+
+            let msg = format!("{}: {}", username.clone().unwrap(), text);
+            let _ = tx.send(msg.clone());
+
+            let mut hist = HISTORY.lock().unwrap();
+            hist.push(msg);
+            if hist.len() > 200 {
+                hist.remove(0);
+            }
+        }
+    });
+
+    let _ = tokio::join!(send_task, recv_task);
+}
+
+async fn index() -> impl IntoResponse {
+    r#"
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Rust GC</title>
+<style>
+body {
+  margin: 0;
+  background: #1e1f22;
+  color: #dcddde;
+  font-family: sans-serif;
+}
+#chat {
+  height: 90vh;
+  overflow-y: auto;
+  padding: 10px;
+}
+.msg {
+  margin-bottom: 6px;
+}
+#input {
+  display: flex;
+  padding: 10px;
+  background: #2b2d31;
+}
+input {
+  flex: 1;
+  background: #383a40;
+  border: none;
+  color: white;
+  padding: 10px;
+}
+input:focus { outline: none; }
+</style>
+</head>
+<body>
+
+<div id="chat"></div>
+
+<div id="input">
+  <input id="box" placeholder="Type message and press Enter…" />
+</div>
+
+<script>
+let ws;
+let username = prompt("Username:");
+
+function connect() {
+  ws = new WebSocket(
+    (location.protocol === "https:" ? "wss://" : "ws://") +
+    location.host + "/ws"
+  );
+
+  ws.onopen = () => {
+    ws.send(username);
+  };
+
+  ws.onmessage = e => {
+    const div = document.createElement("div");
+    div.className = "msg";
+    div.textContent = e.data;
+    document.getElementById("chat").appendChild(div);
+    document.getElementById("chat").scrollTop =
+      document.getElementById("chat").scrollHeight;
+  };
+}
+
+document.getElementById("box").addEventListener("keydown", e => {
+  if (e.key === "Enter" && ws.readyState === 1) {
+    ws.send(e.target.value);
+    e.target.value = "";
+  }
+});
+
+connect();
+</script>
+
+</body>
+</html>
+"#
 }
